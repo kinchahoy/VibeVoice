@@ -17,9 +17,15 @@ import json
 import re
 from typing import List, Dict, Any, Optional
 from functools import wraps
+import tempfile
+import threading
 
 from vibevoice.modular.modeling_vibevoice_asr import VibeVoiceASRForConditionalGeneration
 from vibevoice.processor.vibevoice_asr_processor import VibeVoiceASRProcessor
+from vibevoice.processor.audio_utils import load_audio_use_ffmpeg
+
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 
 class VibeVoiceASRBatchInference:
@@ -109,6 +115,7 @@ class VibeVoiceASRBatchInference:
         top_p: float = 1.0,
         do_sample: bool = True,
         num_beams: int = 1,
+        context_info: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Transcribe multiple audio files/arrays in a single batch.
@@ -135,7 +142,8 @@ class VibeVoiceASRBatchInference:
             sampling_rate=None,
             return_tensors="pt",
             padding=True,
-            add_generation_prompt=True
+            add_generation_prompt=True,
+            context_info=context_info,
         )
         
         # Move to device
@@ -399,8 +407,337 @@ def load_dataset_and_concatenate(
         return None
 
 
+_TIMESTAMP_PATTERN = re.compile(r"^(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)$")
+_SUPPORTED_AUDIO_RESPONSE_FORMATS = {
+    "json",
+    "text",
+    "srt",
+    "verbose_json",
+    "vtt",
+    "diarized_json",
+}
+
+
+def _allowed_formats_for_model(model_name: str) -> set[str]:
+    """Apply model-specific response-format constraints where required."""
+    name = (model_name or "").strip().lower()
+    if name in {"gpt-4o-transcribe", "gpt-4o-mini-transcribe"}:
+        return {"json"}
+    if name == "gpt-4o-transcribe-diarize":
+        return {"json", "text", "diarized_json"}
+    return set(_SUPPORTED_AUDIO_RESPONSE_FORMATS)
+
+
+def _timestamp_to_seconds(value: Any) -> Optional[float]:
+    """Convert model timestamp values to seconds (best effort)."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        pass
+
+    match = _TIMESTAMP_PATTERN.match(text)
+    if not match:
+        return None
+
+    hours_raw, minutes_raw, seconds_raw = match.groups()
+    hours = int(hours_raw) if hours_raw else 0
+    minutes = int(minutes_raw)
+    seconds = float(seconds_raw)
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def _format_timestamp_srt(seconds: float) -> str:
+    """Format seconds as SRT timestamp: HH:MM:SS,mmm."""
+    total_ms = int(round(max(0.0, float(seconds)) * 1000.0))
+    hours = total_ms // 3_600_000
+    total_ms %= 3_600_000
+    minutes = total_ms // 60_000
+    total_ms %= 60_000
+    secs = total_ms // 1000
+    millis = total_ms % 1000
+    return f"{hours:02}:{minutes:02}:{secs:02},{millis:03}"
+
+
+def _format_timestamp_vtt(seconds: float) -> str:
+    """Format seconds as WebVTT timestamp: HH:MM:SS.mmm."""
+    total_ms = int(round(max(0.0, float(seconds)) * 1000.0))
+    hours = total_ms // 3_600_000
+    total_ms %= 3_600_000
+    minutes = total_ms // 60_000
+    total_ms %= 60_000
+    secs = total_ms // 1000
+    millis = total_ms % 1000
+    return f"{hours:02}:{minutes:02}:{secs:02}.{millis:03}"
+
+
+def _segments_to_text(segments: List[Dict[str, Any]], raw_text: str) -> str:
+    """Build plain transcript text from structured segments when possible."""
+    if segments:
+        text_parts = []
+        for seg in segments:
+            seg_text = seg.get("text", "")
+            if seg_text:
+                text_parts.append(str(seg_text).strip())
+        merged = " ".join(part for part in text_parts if part).strip()
+        if merged:
+            return merged
+    return (raw_text or "").strip()
+
+
+def _build_openai_segments(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Normalize parsed model segments into OpenAI-like segment objects."""
+    openai_segments = []
+    for idx, seg in enumerate(segments):
+        start = _timestamp_to_seconds(seg.get("start_time"))
+        end = _timestamp_to_seconds(seg.get("end_time"))
+        item = {
+            "id": idx,
+            "start": start if start is not None else 0.0,
+            "end": end if end is not None else (start if start is not None else 0.0),
+            "text": str(seg.get("text", "") or ""),
+        }
+        speaker_id = seg.get("speaker_id")
+        if speaker_id is not None:
+            item["speaker"] = str(speaker_id)
+        openai_segments.append(item)
+    return openai_segments
+
+
+def _fallback_segment(transcript_text: str, duration: Optional[float]) -> List[Dict[str, Any]]:
+    end = duration if duration is not None and duration > 0 else 0.0
+    return [{"id": 0, "start": 0.0, "end": end, "text": transcript_text}]
+
+
+def _segments_to_srt(openai_segments: List[Dict[str, Any]], transcript_text: str, duration: Optional[float]) -> str:
+    """Serialize transcript segments to SRT."""
+    items = openai_segments if openai_segments else _fallback_segment(transcript_text, duration)
+    lines: List[str] = []
+    for idx, seg in enumerate(items, start=1):
+        start = float(seg.get("start", 0.0))
+        end = float(seg.get("end", start))
+        end = max(end, start)
+        prefix = f"[{seg['speaker']}] " if seg.get("speaker") else ""
+        lines.append(str(idx))
+        lines.append(f"{_format_timestamp_srt(start)} --> {_format_timestamp_srt(end)}")
+        lines.append(f"{prefix}{seg.get('text', '')}".strip())
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _segments_to_vtt(openai_segments: List[Dict[str, Any]], transcript_text: str, duration: Optional[float]) -> str:
+    """Serialize transcript segments to WebVTT."""
+    items = openai_segments if openai_segments else _fallback_segment(transcript_text, duration)
+    lines: List[str] = ["WEBVTT", ""]
+    for seg in items:
+        start = float(seg.get("start", 0.0))
+        end = float(seg.get("end", start))
+        end = max(end, start)
+        prefix = f"[{seg['speaker']}] " if seg.get("speaker") else ""
+        lines.append(f"{_format_timestamp_vtt(start)} --> {_format_timestamp_vtt(end)}")
+        lines.append(f"{prefix}{seg.get('text', '')}".strip())
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _get_audio_duration_seconds(audio_path: str) -> Optional[float]:
+    """Try reading the audio to compute duration for verbose responses."""
+    try:
+        audio, sample_rate = load_audio_use_ffmpeg(audio_path, resample=False)
+        if sample_rate > 0:
+            return float(len(audio)) / float(sample_rate)
+    except Exception:
+        return None
+    return None
+
+
+def create_openai_asr_app(
+    asr: VibeVoiceASRBatchInference,
+    *,
+    served_model_name: str,
+    default_max_new_tokens: int,
+    default_top_p: float,
+    default_num_beams: int,
+) -> FastAPI:
+    """
+    Create an OpenAI-compatible ASR API app.
+
+    Endpoint implemented:
+      - POST /v1/audio/transcriptions
+    """
+    app = FastAPI(title="VibeVoice ASR OpenAI-Compatible API")
+    inference_lock = threading.Lock()
+
+    @app.get("/health")
+    async def health() -> Dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/v1/models")
+    async def list_models() -> Dict[str, Any]:
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "id": served_model_name,
+                    "object": "model",
+                    "owned_by": "vibevoice",
+                }
+            ],
+        }
+
+    @app.post("/v1/audio/transcriptions")
+    async def transcriptions(
+        request: Request,
+        file: UploadFile = File(...),
+        model: str = Form(default=served_model_name),
+        prompt: Optional[str] = Form(default=None),
+        response_format: str = Form(default="json"),
+        temperature: float = Form(default=0.0),
+        language: Optional[str] = Form(default=None),
+        max_new_tokens: int = Form(default=default_max_new_tokens),
+        top_p: float = Form(default=default_top_p),
+        num_beams: int = Form(default=default_num_beams),
+    ):
+        del language  # Model auto-detects language.
+        requested_model = (model or served_model_name).strip() or served_model_name
+
+        fmt = (response_format or "json").strip().lower()
+        if fmt not in _SUPPORTED_AUDIO_RESPONSE_FORMATS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Unsupported response_format. Use one of: "
+                    "json, text, srt, verbose_json, vtt, diarized_json."
+                ),
+            )
+        allowed_formats = _allowed_formats_for_model(requested_model)
+        if fmt not in allowed_formats:
+            allowed_list = ", ".join(sorted(allowed_formats))
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Model '{requested_model}' supports response_format: {allowed_list}. "
+                    f"Received: {fmt}"
+                ),
+            )
+        if temperature < 0:
+            raise HTTPException(status_code=400, detail="temperature must be >= 0")
+        if max_new_tokens <= 0:
+            raise HTTPException(status_code=400, detail="max_new_tokens must be > 0")
+        if num_beams <= 0:
+            raise HTTPException(status_code=400, detail="num_beams must be > 0")
+
+        form_data = await request.form()
+        timestamp_granularities = (
+            form_data.getlist("timestamp_granularities[]")
+            or form_data.getlist("timestamp_granularities")
+        )
+
+        audio_bytes = await file.read()
+        if not audio_bytes:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+        suffix = Path(file.filename or "audio.wav").suffix or ".wav"
+        temp_audio_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp.write(audio_bytes)
+                temp_audio_path = tmp.name
+
+            with inference_lock:
+                result = asr.transcribe_batch(
+                    [temp_audio_path],
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    do_sample=temperature > 0,
+                    num_beams=num_beams,
+                    context_info=prompt,
+                )[0]
+
+            raw_text = result.get("raw_text", "")
+            segments = result.get("segments", [])
+            transcript_text = _segments_to_text(segments, raw_text)
+            openai_segments = _build_openai_segments(segments)
+            needs_duration = fmt in {"verbose_json", "srt", "vtt", "diarized_json"}
+            duration = _get_audio_duration_seconds(temp_audio_path) if needs_duration else None
+
+            if fmt == "text":
+                return PlainTextResponse(transcript_text)
+
+            if fmt == "srt":
+                return PlainTextResponse(
+                    _segments_to_srt(openai_segments, transcript_text, duration),
+                    media_type="application/x-subrip",
+                )
+
+            if fmt == "vtt":
+                return PlainTextResponse(
+                    _segments_to_vtt(openai_segments, transcript_text, duration),
+                    media_type="text/vtt",
+                )
+
+            if fmt == "diarized_json":
+                diarized_segments = openai_segments if openai_segments else _fallback_segment(transcript_text, duration)
+                normalized_diarized_segments = []
+                for idx, seg in enumerate(diarized_segments):
+                    item = dict(seg)
+                    item["id"] = idx
+                    item["speaker"] = str(item.get("speaker", "unknown"))
+                    normalized_diarized_segments.append(item)
+                diarized_payload: Dict[str, Any] = {
+                    "text": transcript_text,
+                    "segments": normalized_diarized_segments,
+                }
+                if duration is not None:
+                    diarized_payload["duration"] = duration
+                return JSONResponse(diarized_payload)
+
+            if fmt == "verbose_json":
+                payload: Dict[str, Any] = {
+                    "task": "transcribe",
+                    "text": transcript_text,
+                    "segments": openai_segments,
+                }
+                if duration is not None:
+                    payload["duration"] = duration
+
+                if (
+                    timestamp_granularities
+                    and "word" in timestamp_granularities
+                    and "words" not in payload
+                ):
+                    # Word-level timestamps are not natively produced by this model.
+                    payload["words"] = []
+
+                return JSONResponse(payload)
+
+            return JSONResponse({"text": transcript_text})
+
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Transcription failed: {exc}") from exc
+        finally:
+            if temp_audio_path and os.path.exists(temp_audio_path):
+                os.remove(temp_audio_path)
+
+    return app
+
+
 def main():
-    parser = argparse.ArgumentParser(description="VibeVoice ASR Batch Inference Demo")
+    parser = argparse.ArgumentParser(
+        description="VibeVoice ASR Batch Inference + OpenAI-Compatible API"
+    )
     parser.add_argument(
         "--model_path", 
         type=str, 
@@ -482,8 +819,35 @@ def main():
         choices=["flash_attention_2", "sdpa", "eager", "auto"],
         help="Attention implementation to use. 'auto' will select the best available for your device (flash_attention_2 for CUDA, sdpa for MPS/CPU/XPU)"
     )
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="Run an OpenAI-compatible ASR API server instead of batch file inference",
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="0.0.0.0",
+        help="Server host for --serve mode",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Server port for --serve mode",
+    )
+    parser.add_argument(
+        "--served_model_name",
+        type=str,
+        default="vibevoice-asr",
+        help="Model name returned by /v1/models in --serve mode",
+    )
     
     args = parser.parse_args()
+
+    if not args.model_path:
+        print("Please provide --model_path, e.g. microsoft/VibeVoice-ASR")
+        return
     
     # Auto-detect best attention implementation based on device
     if args.attn_implementation == "auto":
@@ -499,40 +863,6 @@ def main():
             args.attn_implementation = "sdpa"
         print(f"Auto-detected attention implementation: {args.attn_implementation}")
     
-    # Collect audio files
-    audio_files = []
-    concatenated_audio = None  # For storing concatenated dataset audio
-    
-    if args.audio_files:
-        audio_files.extend(args.audio_files)
-    
-    if args.audio_dir:
-        import glob
-        for ext in ["*.wav", "*.mp3", "*.flac", "*.mp4", "*.m4a", "*.webm"]:
-            audio_files.extend(glob.glob(os.path.join(args.audio_dir, ext)))
-    
-    if args.dataset:
-        concatenated_audio = load_dataset_and_concatenate(
-            dataset_name=args.dataset,
-            split=args.split,
-            max_duration=args.max_duration,
-            num_audios=args.batch_size,
-        )
-        if concatenated_audio is None:
-            return
-    
-    if len(audio_files) == 0 and concatenated_audio is None:
-        print("No audio files provided. Please specify --audio_files, --audio_dir, or --dataset.")
-        return
-    
-    if audio_files:
-        print(f"\nAudio files to process ({len(audio_files)}):")
-        for f in audio_files:
-            print(f"  - {f}")
-    
-    if concatenated_audio:
-        print(f"\nConcatenated dataset audios: {len(concatenated_audio)} audio(s)")
-    
     # Initialize model
     # Force float16 for model loading in this script.
     model_dtype = torch.float16
@@ -543,6 +873,54 @@ def main():
         dtype=model_dtype,
         attn_implementation=args.attn_implementation
     )
+
+    if args.serve:
+        import uvicorn
+
+        app = create_openai_asr_app(
+            asr=asr,
+            served_model_name=args.served_model_name,
+            default_max_new_tokens=args.max_new_tokens,
+            default_top_p=args.top_p,
+            default_num_beams=args.num_beams,
+        )
+        print(f"Starting OpenAI-compatible ASR server on http://{args.host}:{args.port}")
+        uvicorn.run(app, host=args.host, port=args.port)
+        return
+
+    # Collect audio files (batch mode)
+    audio_files = []
+    concatenated_audio = None  # For storing concatenated dataset audio
+
+    if args.audio_files:
+        audio_files.extend(args.audio_files)
+
+    if args.audio_dir:
+        import glob
+        for ext in ["*.wav", "*.mp3", "*.flac", "*.mp4", "*.m4a", "*.webm"]:
+            audio_files.extend(glob.glob(os.path.join(args.audio_dir, ext)))
+
+    if args.dataset:
+        concatenated_audio = load_dataset_and_concatenate(
+            dataset_name=args.dataset,
+            split=args.split,
+            max_duration=args.max_duration,
+            num_audios=args.batch_size,
+        )
+        if concatenated_audio is None:
+            return
+
+    if len(audio_files) == 0 and concatenated_audio is None:
+        print("No audio files provided. Please specify --audio_files, --audio_dir, or --dataset.")
+        return
+
+    if audio_files:
+        print(f"\nAudio files to process ({len(audio_files)}):")
+        for f in audio_files:
+            print(f"  - {f}")
+
+    if concatenated_audio:
+        print(f"\nConcatenated dataset audios: {len(concatenated_audio)} audio(s)")
     
     # If temperature is 0, use greedy decoding (no sampling)
     do_sample = args.temperature > 0

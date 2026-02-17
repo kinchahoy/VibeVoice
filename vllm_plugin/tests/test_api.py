@@ -172,7 +172,7 @@ def test_transcription_with_hotwords(
                 ]
             }
         ],
-        "max_tokens": 32768,       
+        "max_tokens": 21768,       
         "temperature": 0.0,      
         "stream": True,
         "top_p": 1.0,

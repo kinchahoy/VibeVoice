@@ -106,6 +106,75 @@ from vibevoice.modular.configuration_vibevoice import (
 )
 
 
+def _normalize_torch_dtype(
+    dtype_like: Any,
+    *,
+    default: torch.dtype,
+) -> torch.dtype:
+    """Convert config/runtime dtype values to torch.dtype."""
+    if isinstance(dtype_like, torch.dtype):
+        return dtype_like
+    if isinstance(dtype_like, str):
+        return getattr(torch, dtype_like, default)
+    return default
+
+
+def _supports_bfloat16() -> bool:
+    """Best-effort BF16 capability check across CUDA/ROCm builds."""
+    if not torch.cuda.is_available():
+        return False
+    if hasattr(torch.cuda, "is_bf16_supported"):
+        try:
+            return bool(torch.cuda.is_bf16_supported())
+        except Exception:
+            pass
+    # Conservative fallback for older/special ROCm builds.
+    return False
+
+
+def _resolve_runtime_dtype(
+    dtype_like: Any,
+    *,
+    default: torch.dtype,
+    fallback_if_unsupported_bf16: torch.dtype,
+) -> torch.dtype:
+    dtype = _normalize_torch_dtype(dtype_like, default=default)
+    if dtype == torch.bfloat16 and not _supports_bfloat16():
+        return fallback_if_unsupported_bf16
+    return dtype
+
+
+def _get_cfg_value(cfg_obj: Any, key: str, default: Any) -> Any:
+    if isinstance(cfg_obj, dict):
+        return cfg_obj.get(key, default)
+    return getattr(cfg_obj, key, default)
+
+
+def _get_mm_max_audio_seconds(hf_config: Any) -> float:
+    """Max audio duration used for multimodal scheduling/profiling.
+
+    Priority:
+    1) VIBEVOICE_VLLM_MAX_AUDIO_SECONDS env
+    2) hf config: vllm_mm_max_audio_seconds
+    3) default 1800s (30 minutes)
+    """
+    env_val = os.getenv("VIBEVOICE_VLLM_MAX_AUDIO_SECONDS")
+    if env_val:
+        try:
+            seconds = float(env_val)
+            if seconds > 0:
+                return seconds
+        except ValueError:
+            pass
+
+    cfg_seconds = _get_cfg_value(hf_config, "vllm_mm_max_audio_seconds", 1800.0)
+    try:
+        cfg_seconds = float(cfg_seconds)
+    except (TypeError, ValueError):
+        cfg_seconds = 1500.0 #Reduced to 1500
+    return max(1.0, cfg_seconds)
+
+
 class SpeechConnector(nn.Module):
     """Projects speech features to language model hidden dimension.
     
@@ -212,13 +281,11 @@ class VibeVoiceAudioEncoder(nn.Module):
         
         # Get audio encoder dtype from config (defaults to float32 for precision)
         root_torch_dtype = get_cfg(config, "torch_dtype", None)
-        if root_torch_dtype is not None:
-            if isinstance(root_torch_dtype, str):
-                self._audio_encoder_dtype = getattr(torch, root_torch_dtype)
-            else:
-                self._audio_encoder_dtype = root_torch_dtype
-        else:
-            self._audio_encoder_dtype = torch.float32
+        self._audio_encoder_dtype = _resolve_runtime_dtype(
+            root_torch_dtype,
+            default=torch.float32,
+            fallback_if_unsupported_bf16=torch.float32,
+        )
         
         self.acoustic_connector = SpeechConnector(self.acoustic_vae_dim, self.hidden_size)
         self.semantic_connector = SpeechConnector(self.semantic_vae_dim, self.hidden_size)
@@ -238,10 +305,8 @@ class VibeVoiceAudioEncoder(nn.Module):
         use_mean_env = os.getenv("VIBEVOICE_USE_MEAN", "").strip().lower()
         self.use_sample = use_mean_env not in ("1", "true", "yes")
         
-        # Language model dtype (set by VibeVoiceForCausalLM.__init__)
-        # This is the dtype that audio embeddings will be converted to before
-        # being passed to the language model. Defaults to bfloat16.
-        self._lm_dtype: torch.dtype = torch.bfloat16
+        # Language model dtype (set by VibeVoiceForCausalLM.__init__).
+        self._lm_dtype: torch.dtype = torch.float16
 
     def _ensure_audio_encoder_dtype(self):
         """Ensure all audio encoder components use the correct dtype from config.
@@ -537,28 +602,14 @@ class VibeVoiceProcessingInfo(BaseProcessingInfo):
     ) -> Mapping[str, int]:
         """Return the maximum number of audio tokens per item.
 
-        This tells vLLM's scheduler the upper bound so that
-        ``encoder_compute_budget`` is large enough for any audio length
-        the model can handle, preventing the silent scheduling deadlock
-        described in docs/max_num_batched_tokens_issue.md.
-
-        Formula: audio_tokens = ceil(audio_samples / compress_ratio) + 3
-        where +3 accounts for speech_start, speech_end, and newline tokens.
-        The max audio samples is bounded by seq_len (the model's context
-        window cannot hold more tokens than that).
+        This controls encoder compute budget. Keep it realistic, otherwise
+        vLLM startup profiling can consume all VRAM and leave no KV cache.
         """
         hf_config = self.get_hf_config()
-
-        def _cfg(key: str, default):
-            if isinstance(hf_config, dict):
-                return hf_config.get(key, default)
-            return getattr(hf_config, key, default)
-
-        compress_ratio = int(_cfg("speech_tok_compress_ratio", 3200))
-        sample_rate = int(_cfg("target_sample_rate", 24000))
-
-        # Upper bound: 61-minute audio at 24 kHz
-        max_audio_samples = 61 * 60 * sample_rate  # 88,464,000
+        compress_ratio = int(_get_cfg_value(hf_config, "speech_tok_compress_ratio", 3200))
+        sample_rate = int(_get_cfg_value(hf_config, "target_sample_rate", 24000))
+        max_audio_seconds = _get_mm_max_audio_seconds(hf_config)
+        max_audio_samples = int(max_audio_seconds * sample_rate)
         max_audio_tokens = int(np.ceil(max_audio_samples / compress_ratio)) + 3
 
         # Cannot exceed the model's context window
@@ -581,23 +632,13 @@ class VibeVoiceDummyInputsBuilder(BaseDummyInputsBuilder[VibeVoiceProcessingInfo
     
     def _get_max_audio_samples(self, seq_len: int) -> int:
         """Compute maximum audio samples consistent with ``get_mm_max_tokens_per_item``.
-        
-        Uses the same formula: max_tokens = min(ceil(61min * sr / ratio) + 3, seq_len),
-        then converts back to samples.
         """
         hf_config = self.info.get_hf_config()
-
-        def _cfg(key: str, default):
-            if isinstance(hf_config, dict):
-                return hf_config.get(key, default)
-            return getattr(hf_config, key, default)
-
-        compress_ratio = int(_cfg("speech_tok_compress_ratio", 3200))
-        sample_rate = int(_cfg("target_sample_rate", 24000))
-
-        # Upper bound: 61-minute audio at 24 kHz
-        max_hour_samples = 61 * 60 * sample_rate  # 88,464,000
-        max_tokens_from_audio = int(np.ceil(max_hour_samples / compress_ratio)) + 3
+        compress_ratio = int(_get_cfg_value(hf_config, "speech_tok_compress_ratio", 3200))
+        sample_rate = int(_get_cfg_value(hf_config, "target_sample_rate", 24000))
+        max_audio_seconds = _get_mm_max_audio_seconds(hf_config)
+        max_audio_samples = int(max_audio_seconds * sample_rate)
+        max_tokens_from_audio = int(np.ceil(max_audio_samples / compress_ratio)) + 3
         # Cannot exceed model context window
         max_tokens = min(max_tokens_from_audio, seq_len)
         # Convert tokens back to samples
@@ -633,7 +674,7 @@ class VibeVoiceDummyInputsBuilder(BaseDummyInputsBuilder[VibeVoiceProcessingInfo
             "audio": self._get_dummy_audios(
                 length=max_audio_len,
                 num_audios=num_audios,
-                overrides=audio_overrides,
+       #         overrides=audio_overrides,
             )
         }
 
@@ -945,9 +986,12 @@ class VibeVoiceForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         # This should match vLLM's --dtype flag (e.g., bfloat16, float16, float32)
         # Audio encoder internal computation stays in fp32 for numerical precision,
         # but output is converted to LM dtype for compatibility
-        lm_dtype = vllm_config.model_config.dtype
-        if lm_dtype is not None:
-            self.audio_encoder._lm_dtype = lm_dtype
+        lm_dtype = getattr(vllm_config.model_config, "dtype", None)
+        self.audio_encoder._lm_dtype = _resolve_runtime_dtype(
+            lm_dtype,
+            default=torch.float16,
+            fallback_if_unsupported_bf16=torch.float16,
+        )
         
         # Ensure audio encoder uses correct dtype (typically fp32 for precision)
         try:
@@ -959,7 +1003,7 @@ class VibeVoiceForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         return self.language_model.compute_logits(hidden_states)
 
 
-    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+    def _embed_multimodal_impl(self, **kwargs: object) -> MultiModalEmbeddings:
         """
         Extract audio embeddings using VibeVoice's acoustic/semantic tokenizers.
         
@@ -1025,7 +1069,7 @@ class VibeVoiceForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         # Get model device for tensor placement.
         # dtype is NOT set here — audio_encoder.forward() handles it internally:
         #   input: converted to fp32 (self._audio_encoder_dtype)
-        #   output: converted to bfloat16 (self._lm_dtype)
+        #   output: converted to runtime LM dtype (self._lm_dtype)
         try:
             device = next(self.audio_encoder.parameters()).device
         except StopIteration:
@@ -1096,29 +1140,59 @@ class VibeVoiceForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         
         return tuple(embeddings)
 
-    def get_input_embeddings(self) -> torch.nn.Module:
-        """Return the text embedding layer (embed_tokens).
-        
-        vLLM uses this to get the embedding module for converting token IDs 
-        to embeddings during decode phase.
-        
-        Returns:
-            The embed_tokens module from the language model
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+        # vLLM >= 0.8 multimodal API
+        return self._embed_multimodal_impl(**kwargs)
+
+    def get_multimodal_embeddings(self, **kwargs: object) -> MultiModalEmbeddings:
+        # Backward-compatible API used by some vLLM builds/forks.
+        return self._embed_multimodal_impl(**kwargs)
+
+    def get_input_embeddings(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        multimodal_embeddings: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
+        is_multimodal: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Union[torch.nn.Module, torch.Tensor]:
+        """Get text embedding module or compute merged input embeddings.
+
+        Compatibility behavior:
+        - Legacy callers: `get_input_embeddings()` -> returns embed_tokens module.
+        - vLLM V1 callers: `get_input_embeddings(input_ids=..., ...)` -> returns
+          pre-merged input embeddings tensor.
         """
         # Get embed_tokens from the language model
         if hasattr(self.language_model, 'model') and hasattr(self.language_model.model, 'embed_tokens'):
-            return self.language_model.model.embed_tokens
+            embed_tokens = self.language_model.model.embed_tokens
         elif hasattr(self.language_model, 'embed_tokens'):
-            return self.language_model.embed_tokens
+            embed_tokens = self.language_model.embed_tokens
         else:
             # Try to get from inner model
             inner = self.language_model
             if hasattr(inner, 'language_model'):
                 inner = inner.language_model
             if hasattr(inner, 'model') and hasattr(inner.model, 'embed_tokens'):
-                return inner.model.embed_tokens
-        
-        raise AttributeError("Cannot find embed_tokens layer")
+                embed_tokens = inner.model.embed_tokens
+            else:
+                raise AttributeError("Cannot find embed_tokens layer")
+
+        # Legacy API: return the embedding module itself.
+        if input_ids is None:
+            return embed_tokens
+
+        # vLLM V1 API: return concrete embeddings, merged with multimodal if present.
+        from vllm.model_executor.models.utils import _merge_multimodal_embeddings
+        inputs_embeds = embed_tokens(input_ids)
+
+        if multimodal_embeddings is not None and is_multimodal is not None:
+            inputs_embeds = _merge_multimodal_embeddings(
+                inputs_embeds,
+                multimodal_embeddings,
+                is_multimodal,
+            )
+
+        return inputs_embeds
     
     def embed_input_ids(
         self, 
@@ -1142,22 +1216,12 @@ class VibeVoiceForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         Returns:
             Tensor of embeddings with multimodal content merged in
         """
-        from vllm.model_executor.models.utils import _merge_multimodal_embeddings
-        
-        # Get text embeddings
-        embed_tokens = self.get_input_embeddings()
-        inputs_embeds = embed_tokens(input_ids)
-        
-        # Merge multimodal embeddings if provided
-        if multimodal_embeddings is not None and is_multimodal is not None:
-            # Use vLLM's standard merge function which handles List[Tensor] correctly
-            inputs_embeds = _merge_multimodal_embeddings(
-                inputs_embeds,
-                multimodal_embeddings,
-                is_multimodal,
-            )
-        
-        return inputs_embeds
+        return self.get_input_embeddings(
+            input_ids=input_ids,
+            multimodal_embeddings=multimodal_embeddings,
+            is_multimodal=is_multimodal,
+            **kwargs,
+        )
 
     def get_language_model(self) -> torch.nn.Module:
         """Return the language model backbone."""
